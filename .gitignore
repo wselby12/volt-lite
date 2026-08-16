@@ -1,0 +1,14 @@
+.env
+*.sqlite3
+*.db
+*.db-journal
+logs/
+*.log
+__pycache__/
+venv/
+.env.local
+*.key
+*.pem
+*.sqlite
+
+# Do not commit private keys or secrets
