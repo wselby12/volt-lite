@@ -21,13 +21,16 @@ class PumpListener:
         self._ws = None
 
     async def run(self, on_update: Callable[[dict], Any]):
+        """Main loop: maintain WebSocket connection with exponential backoff and forward candidate updates.
+        on_update is an async callable accepting a dict with keys: pubkey, progress, reserves
+        """
         while True:
             try:
                 await self._connect(on_update)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.error("WS error", error=str(e), stack=traceback.format_exc())
+                self.logger.error("RPC_ERROR", error=str(e), stack=traceback.format_exc())
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, self._max_backoff)
                 self.logger.info("WS_RECONNECT", backoff=self._backoff)
@@ -37,7 +40,7 @@ class PumpListener:
         async with websockets.connect(self.wss, ping_interval=20) as ws:
             self._ws = ws
             self._backoff = 1
-            # subscribe to program
+            # subscribe to program using programSubscribe
             req = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -46,7 +49,8 @@ class PumpListener:
                     self.program_id,
                     {
                         "encoding": "base64",
-                        # Subscriptions can include filters; left minimal here.
+                        # Filters can be added here to reduce noise. Without the official layout we keep it minimal.
+                        # Example placeholder: "filters": [{"dataSize": 200}]
                     },
                 ],
             }
@@ -59,32 +63,33 @@ class PumpListener:
                 except Exception:
                     self.logger.error("malformed_ws_message")
                     continue
-                # look for result notifications
-                if data.get("method") == "programNotification" or data.get("params"):
-                    params = data.get("params") or {}
-                    result = params.get("result") or {}
-                    value = result.get("value") or {}
-                    account = value.get("account") or {}
-                    raw = account.get("data")
-                    if raw and isinstance(raw, list) and len(raw) >= 1:
-                        b64 = raw[0]
-                        try:
-                            raw_bytes = base64.b64decode(b64)
-                        except Exception:
-                            self.logger.error("ws_base64_decode_failed")
-                            continue
-                        try:
-                            progress = parse_progress_from_account(raw_bytes)
-                            reserves = extract_reserves(raw_bytes)
-                            update = {
-                                "pubkey": value.get("pubkey"),
-                                "progress": progress,
-                                "reserves": reserves,
-                                "raw": None,
-                            }
-                            # Only forward candidates near threshold
-                            if progress >= self.cfg.MIN_CURVE_PROGRESS:
+                # notifications have a params.result.value.account.data field
+                params = data.get("params") or {}
+                result = params.get("result") or {}
+                value = result.get("value") or {}
+                account = value.get("account") or {}
+                raw = account.get("data")
+                if raw and isinstance(raw, list) and len(raw) >= 1:
+                    b64 = raw[0]
+                    try:
+                        raw_bytes = base64.b64decode(b64)
+                    except Exception:
+                        self.logger.error("ws_base64_decode_failed")
+                        continue
+                    try:
+                        progress = parse_progress_from_account(raw_bytes)
+                        reserves = extract_reserves(raw_bytes)
+                        update = {
+                            "pubkey": value.get("pubkey") or result.get("pubkey"),
+                            "progress": progress,
+                            "reserves": reserves,
+                        }
+                        # Only forward candidates near threshold
+                        if progress >= self.cfg.MIN_CURVE_PROGRESS:
+                            try:
                                 await on_update(update)
-                        except Exception as e:
-                            self.logger.error("process_account_failed", error=str(e))
+                            except Exception:
+                                self.logger.error("on_update_handler_error", trace=traceback.format_exc())
+                    except Exception as e:
+                        self.logger.error("process_account_failed", error=str(e))
 

@@ -8,8 +8,8 @@ class PositionManager:
         self.logger = logger
 
     async def reload_open_positions(self):
-        # placeholder
-        return []
+        # placeholder - in this version we rely directly on db.get_open_positions()
+        return await self.db.get_open_positions()
 
     async def open_count(self) -> int:
         async with self.db.conn.execute("SELECT COUNT(*) FROM positions WHERE closed=0") as cur:

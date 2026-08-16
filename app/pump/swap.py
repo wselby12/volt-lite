@@ -8,6 +8,7 @@ from solana.keypair import Keypair
 from app.pump.constants import PUMP_SWAP_API, SOL_MINT
 from app.logger import setup_logging
 from typing import Optional
+import os
 
 
 class SwapClient:
@@ -26,13 +27,20 @@ class SwapClient:
             "slippagePct": slippage_pct,
         }
         async with aiohttp.ClientSession() as session:
-            async with session.post(PUMP_SWAP_API, json=payload, timeout=20) as resp:
-                if resp.status != 200:
+            try:
+                async with session.post(PUMP_SWAP_API, json=payload, timeout=20) as resp:
                     text = await resp.text()
-                    self.logger.error("swap_api_error", status=resp.status, body=text)
-                    return None
-                data = await resp.json()
-                return data
+                    if resp.status != 200:
+                        self.logger.error("swap_api_error", status=resp.status, body=text)
+                        return None
+                    data = json.loads(text)
+                    return data
+            except asyncio.TimeoutError:
+                self.logger.error("swap_api_timeout")
+                return None
+            except Exception as e:
+                self.logger.error("swap_api_exception", error=str(e))
+                return None
 
     async def deserialize_and_simulate(self, client: AsyncClient, b64_tx: str) -> Optional[VersionedTransaction]:
         try:
@@ -44,9 +52,14 @@ class SwapClient:
 
         # simulate
         try:
-            # send base64 for simulation
+            # the RPC expects base64-encoded transaction for simulation input
             sim = await client.simulate_transaction(tx)
-            if sim.get("error") or sim.get("value", {}).get("err"):
+            if sim is None:
+                self.logger.error("simulation_none_response")
+                return None
+            # Check for errors in returned structure (compatibility across RPCs may vary)
+            val = sim.get("value") if isinstance(sim, dict) else None
+            if isinstance(val, dict) and val.get("err"):
                 self.logger.error("simulation_failed", result=sim)
                 return None
         except Exception as e:
@@ -55,33 +68,48 @@ class SwapClient:
 
         return tx
 
-    async def sign_and_send(self, client: AsyncClient, tx: VersionedTransaction, private_key_env: str) -> Optional[str]:
+    def _load_keypair_from_env(self, private_key_env: str) -> Optional[Keypair]:
         if not private_key_env:
-            self.logger.error("no_private_key")
             return None
-        # parse key: allow base58 or json array
         try:
-            if private_key_env.strip().startswith("["):
+            sk = private_key_env.strip()
+            if sk.startswith("["):
                 import json as _json
-                arr = _json.loads(private_key_env)
-                sk = bytes(arr)
+                arr = _json.loads(sk)
+                skb = bytes(arr)
             else:
+                # assume base58
                 import base58
-                sk = base58.b58decode(private_key_env)
-            kp = Keypair.from_secret_key(sk)
+                skb = base58.b58decode(sk)
+            kp = Keypair.from_secret_key(skb)
+            return kp
         except Exception as e:
             self.logger.error("parse_key_failed", error=str(e))
             return None
 
-        # sign
+    async def sign_and_send(self, client: AsyncClient, tx: VersionedTransaction, private_key_env: str) -> Optional[str]:
+        kp = self._load_keypair_from_env(private_key_env)
+        if not kp:
+            self.logger.error("no_private_key")
+            return None
+
+        # Sign the transaction with the single keypair
         try:
+            # VersionedTransaction.sign expects a list of Signer-like objects
             tx.sign([kp])
             raw = tx.serialize()
-            b64 = base64.b64encode(raw).decode()
+            # send raw transaction bytes
             send_resp = await client.send_raw_transaction(raw)
-            sig = send_resp.get("result")
-            # confirm
-            await client.confirm_transaction(sig)
+            if not send_resp:
+                self.logger.error("send_raw_no_response")
+                return None
+            sig = send_resp.get("result") or send_resp.get("signature")
+            # confirm (best-effort)
+            try:
+                if sig:
+                    await client.confirm_transaction(sig)
+            except Exception:
+                self.logger.info("confirm_failed_but_ignoring")
             return sig
         except Exception as e:
             self.logger.error("send_failed", error=str(e))

@@ -3,12 +3,15 @@ import time
 from typing import Dict, Any
 from app.config import Config
 from app.logger import setup_logging
-from pump.swap import SwapClient
-from trading.positions import PositionManager
-from storage.database import Database
-from strategy.entry import EntryManager
+from app.pump.swap import SwapClient
+from app.trading.positions import PositionManager
+from app.storage.database import Database
+from app.strategy.entry import EntryManager
+from app.strategy.exits import ExitManager
 from app.pump.constants import SOL_MINT
 from solana.rpc.async_api import AsyncClient
+from base58 import b58decode
+from solana.keypair import Keypair
 
 class TradingExecutor:
     def __init__(self, cfg: Config, db: Database, logger=None):
@@ -18,6 +21,7 @@ class TradingExecutor:
         self.swap = SwapClient(cfg, self.logger)
         self.positions = PositionManager(db, self.logger)
         self.entry = EntryManager(cfg, self.logger)
+        self.exit_mgr = ExitManager(cfg, self.logger)
         self.client = AsyncClient(cfg.SOLANA_RPC_URL)
         self._locks = {}
         self._buy_history = []  # timestamps of buys
@@ -27,7 +31,7 @@ class TradingExecutor:
         while True:
             try:
                 await asyncio.sleep(5)
-                await self.positions.reload_open_positions()
+                await self._check_positions()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -81,27 +85,16 @@ class TradingExecutor:
                 self.logger.info("already_holding", pubkey=pubkey)
                 return
 
+            # daily spend check
+            daily_spend = await self.db.get_daily_buy_total()
+            if daily_spend + self.cfg.BUY_AMOUNT_SOL > self.cfg.MAX_DAILY_BUY_SOL:
+                self.logger.info("daily_limit_reached", daily_spend=daily_spend)
+                return
+
             # build swap via Pump API
             lamports = int(self.cfg.BUY_AMOUNT_SOL * 1_000_000_000)
-            user = self.client._provider._wallet.public_key if hasattr(self.client, "_provider") else None
-            # user/fpayer should come from env wallet public key; fallback to None
-            wallet_pub = None
-            if self.cfg.SOLANA_PRIVATE_KEY:
-                # try to derive public key without exposing private key
-                from base58 import b58decode
-                from solana.keypair import Keypair
-                try:
-                    sk = self.cfg.SOLANA_PRIVATE_KEY
-                    if sk.strip().startswith("["):
-                        import json as _json
-                        arr = _json.loads(sk)
-                        skb = bytes(arr)
-                    else:
-                        skb = b58decode(sk)
-                    kp = Keypair.from_secret_key(skb)
-                    wallet_pub = str(kp.public_key)
-                except Exception:
-                    wallet_pub = None
+
+            wallet_pub = self._derive_pubkey_from_env()
             if not wallet_pub:
                 self.logger.error("missing_wallet_pubkey")
                 return
@@ -138,3 +131,77 @@ class TradingExecutor:
             self.logger.info("BUY_SUBMITTED", pubkey=pubkey, sig=sig)
         finally:
             self._locks.pop(pubkey, None)
+
+    def _derive_pubkey_from_env(self) -> str | None:
+        sk = self.cfg.SOLANA_PRIVATE_KEY
+        if not sk:
+            return None
+        try:
+            if sk.strip().startswith("["):
+                import json as _json
+                arr = _json.loads(sk)
+                skb = bytes(arr)
+            else:
+                skb = b58decode(sk)
+            kp = Keypair.from_secret_key(skb)
+            return str(kp.public_key)
+        except Exception:
+            return None
+
+    async def _check_positions(self):
+        # load open positions and evaluate exit conditions
+        open_positions = await self.db.get_open_positions()
+        for pos in open_positions:
+            try:
+                # refresh market estimate: TODO - derive current value via on-chain queries or price oracles
+                # For now we use tokens_received * 0 as placeholder (needs real pricing)
+                pos = dict(pos)
+                pos["current_value"] = pos.get("highest_value") or pos.get("entry_price") or 0
+                action = self.exit_mgr.evaluate_position(pos)
+                if action:
+                    await self._execute_exit(pos, action)
+            except Exception as e:
+                self.logger.error("position_check_error", error=str(e))
+
+    async def _execute_exit(self, position: Dict[str, Any], action: Dict[str, Any]):
+        mint = position.get("mint")
+        if not mint:
+            return
+        # per-mint lock
+        if self._locks.get(mint):
+            return
+        self._locks[mint] = True
+        try:
+            # build sell via Pump API (swap input=TOKEN, output=SOL)
+            # amount: if sell_all -> use tokens_received from position; if partial -> calculate percent
+            tokens = position.get("tokens_received") or 0
+            if action.get("action") == "sell_all":
+                amount = str(int(tokens))
+            elif action.get("action") == "sell_partial":
+                sell_pct = action.get("sell_pct", 0) / 100.0
+                amount = str(int(tokens * sell_pct))
+            else:
+                return
+
+            wallet_pub = self._derive_pubkey_from_env()
+            if not wallet_pub:
+                self.logger.error("missing_wallet_pubkey")
+                return
+
+            swap = await self.swap.build_swap(mint, SOL_MINT, amount, wallet_pub, wallet_pub, self.cfg.SLIPPAGE_PCT)
+            if not swap or not swap.get("transaction"):
+                self.logger.error("sell_build_failed", resp=swap)
+                return
+            tx_b64 = swap["transaction"]
+            tx = await self.swap.deserialize_and_simulate(self.client, tx_b64)
+            if not tx:
+                self.logger.info("sell_simulation_failed", pubkey=mint)
+                return
+            sig = await self.swap.sign_and_send(self.client, tx, self.cfg.SOLANA_PRIVATE_KEY)
+            if not sig:
+                self.logger.error("sell_send_failed", pubkey=mint)
+                return
+            await self.db.mark_position_closed(position.get("id"), sig)
+            self.logger.info("SELL_SUBMITTED", mint=mint, sig=sig, reason=action.get("reason"))
+        finally:
+            self._locks.pop(mint, None)
